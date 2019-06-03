@@ -12,8 +12,8 @@ def updater():
     """
     print('%s Checking for updates' % run)
     # Changes must be separated by ;
-    changes = "cloning (mirroring) feature;fixed sitemap.xml parsing;reuse tcp connection to boost speed;handle redirect loops;csv export support;other minor bug fixes"
-    latest_commit = requester('https://raw.githubusercontent.com/s0md3v/Photon/master/photon.py', host='github.com')
+    changes = '''major bug fixes;removed ninja mode;dropped python < 3.2 support;fixed unicode output;proxy support;more intels'''
+    latest_commit = requester('https://raw.githubusercontent.com/s0md3v/Photon/master/core/updater.py', host='raw.githubusercontent.com')
     # Just a hack to see if a new version is available
     if changes not in latest_commit:
         changelog = re.search(r"changes = '''(.*?)'''", latest_commit)

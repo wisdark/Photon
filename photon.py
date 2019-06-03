@@ -6,13 +6,29 @@ from __future__ import print_function
 import argparse
 import os
 import re
+import requests
 import sys
 import time
 import warnings
+import random
 
-import requests
+from core.colors import good, info, run, green, red, white, end, bad
 
-from core.colors import good, info, run, green, red, white, end
+# Just a fancy ass banner
+print('''%s      ____  __          __
+     / %s__%s \/ /_  ____  / /_____  ____
+    / %s/_/%s / __ \/ %s__%s \/ __/ %s__%s \/ __ \\
+   / ____/ / / / %s/_/%s / /_/ %s/_/%s / / / /
+  /_/   /_/ /_/\____/\__/\____/_/ /_/ %sv1.3.2%s\n''' %
+      (red, white, red, white, red, white, red, white, red, white, red, white,
+       red, white, end))
+
+try:
+    from urllib.parse import urlparse  # For Python 3
+except ImportError:
+    print('%s Photon runs only on Python 3.2 and above.' % info)
+    quit()
+
 import core.config
 from core.config import INTELS
 from core.flash import flash
@@ -20,31 +36,19 @@ from core.mirror import mirror
 from core.prompt import prompt
 from core.requester import requester
 from core.updater import updater
-from core.utils import top_level, extract_headers, verb, is_link, entropy, regxy, remove_regex, timer, writer
+from core.utils import (luhn,
+                        proxy_type,
+                        is_good_proxy,
+                        top_level,
+                        extract_headers,
+                        verb, is_link,
+                        entropy, regxy,
+                        remove_regex,
+                        timer,
+                        writer)
+from core.regex import rintels, rendpoint, rhref, rscript, rentropy
+
 from core.zap import zap
-
-try:
-    from urllib.parse import urlparse  # For Python 3
-    python2, python3 = False, True
-except ImportError:
-    from urlparse import urlparse  # For Python 2
-    python2, python3 = True, False
-
-
-try:
-    input = raw_input
-except NameError:
-    pass
-
-
-# Just a fancy ass banner
-print('''%s      ____  __          __
-     / %s__%s \/ /_  ____  / /_____  ____
-    / %s/_/%s / __ \/ %s__%s \/ __/ %s__%s \/ __ \\
-   / ____/ / / / %s/_/%s / /_/ %s/_/%s / / / /
-  /_/   /_/ /_/\____/\__/\____/_/ /_/ %sv1.2.1%s\n''' %
-      (red, white, red, white, red, white, red, white, red, white, red, white,
-       red, white, end))
 
 # Disable SSL related warnings
 warnings.filterwarnings('ignore')
@@ -55,7 +59,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-u', '--url', help='root url', dest='root')
 parser.add_argument('-c', '--cookie', help='cookie', dest='cook')
 parser.add_argument('-r', '--regex', help='regex pattern', dest='regex')
-parser.add_argument('-e', '--export', help='export format', dest='export')
+parser.add_argument('-e', '--export', help='export format', dest='export', choices=['csv', 'json'])
 parser.add_argument('-o', '--output', help='output directory', dest='output')
 parser.add_argument('-l', '--level', help='levels to crawl', dest='level',
                     type=int)
@@ -74,6 +78,8 @@ parser.add_argument('--exclude', help='exclude URLs matching this regex',
                     dest='exclude')
 parser.add_argument('--timeout', help='http request timeout', dest='timeout',
                     type=float)
+parser.add_argument('-p', '--proxy', help='Proxy server IP:PORT or DOMAIN:PORT', dest='proxies',
+                    type=proxy_type)
 
 # Switches
 parser.add_argument('--clone', help='clone the website locally', dest='clone',
@@ -82,8 +88,6 @@ parser.add_argument('--headers', help='add headers', dest='headers',
                     action='store_true')
 parser.add_argument('--dns', help='enumerate subdomains and DNS data',
                     dest='dns', action='store_true')
-parser.add_argument('--ninja', help='ninja mode', dest='ninja',
-                    action='store_true')
 parser.add_argument('--keys', help='find secret keys', dest='api',
                     action='store_true')
 parser.add_argument('--update', help='update photon', dest='update',
@@ -118,7 +122,23 @@ delay = args.delay or 0  # Delay between requests
 timeout = args.timeout or 6  # HTTP request timeout
 cook = args.cook or None  # Cookie
 api = bool(args.api)  # Extract high entropy strings i.e. API keys and stuff
-ninja = bool(args.ninja)  # Ninja mode toggle
+
+proxies = []
+if args.proxies:
+    print("%s Testing proxies, can take a while..." % info)
+    for proxy in args.proxies:
+        if is_good_proxy(proxy):
+            proxies.append(proxy)
+        else:
+            print("%s Proxy %s doesn't seem to work or timedout" %
+                  (bad, proxy['http']))
+    print("%s Done" % info)
+    if not proxies:
+        print("%s no working proxies, quitting!" % bad)
+        exit()
+else:
+    proxies.append(None)
+
 crawl_level = args.level or 2  # Crawling level
 thread_count = args.threads or 2  # Number of threads
 only_urls = bool(args.only_urls)  # Only URLs mode is off by default
@@ -135,25 +155,30 @@ external = set()  # URLs that don't belong to the target i.e. out-of-scope
 # URLs that have get params in them e.g. example.com/page.php?id=2
 fuzzable = set()
 endpoints = set()  # URLs found from javascript files
-processed = set()  # URLs that have been crawled
+processed = set(['dummy'])  # URLs that have been crawled
 # URLs that belong to the target i.e. in-scope
 internal = set(args.seeds)
 
 everything = []
-bad_intel = set()  # Unclean intel urls
 bad_scripts = set()  # Unclean javascript file urls
+bad_intel = set() # needed for intel filtering
 
 core.config.verbose = verbose
 
 if headers:
-    headers = extract_headers(prompt())
+    try:
+        prompt = prompt()
+    except FileNotFoundError as e:
+        print('Could not load headers prompt: {}'.format(e))
+        quit()
+    headers = extract_headers(prompt)
 
 # If the user hasn't supplied the root URL with http(s), we will handle it
 if main_inp.startswith('http'):
     main_url = main_inp
 else:
     try:
-        requests.get('https://' + main_inp)
+        requests.get('https://' + main_inp, proxies=random.choice(proxies))
         main_url = 'https://' + main_inp
     except:
         main_url = 'http://' + main_inp
@@ -180,30 +205,43 @@ else:
 
 supress_regex = False
 
-def intel_extractor(response):
+def intel_extractor(url, response):
     """Extract intel from the response body."""
-    matches = re.findall(r'([\w\.-]+s[\w\.-]+\.amazonaws\.com)|([\w\.-]+@[\w\.-]+\.[\.\w]+)', response)
-    if matches:
-        for match in matches:
-            verb('Intel', match)
-            bad_intel.add(match)
+    for rintel in rintels:
+        res = re.sub(r'<(script).*?</\1>(?s)', '', response)
+        res = re.sub(r'<[^<]+?>', '', res)
+        matches = rintel[0].findall(res)
+        if matches:
+            for match in matches:
+                verb('Intel', match)
+                bad_intel.add((match, rintel[1], url))
 
 
 def js_extractor(response):
     """Extract js files from the response body"""
     # Extract .js files
-    matches = re.findall(r'<(script|SCRIPT).*(src|SRC)=([^\s>]+)', response)
+    matches = rscript.findall(response)
     for match in matches:
         match = match[2].replace('\'', '').replace('"', '')
         verb('JS file', match)
         bad_scripts.add(match)
 
+def remove_file(url):
+    if url.count('/') > 2:
+        replacable = re.search(r'/[^/]*?$', url).group()
+        if replacable != '/':
+            return url.replace(replacable, '')
+        else:
+            return url
+    else:
+        return url
+
 def extractor(url):
     """Extract details from the response body."""
-    response = requester(url, main_url, delay, cook, headers, timeout, host, ninja, user_agents, failed, processed)
+    response = requester(url, main_url, delay, cook, headers, timeout, host, proxies, user_agents, failed, processed)
     if clone:
         mirror(url, response)
-    matches = re.findall(r'<[aA].*(href|HREF)=([^\s>]+)', response)
+    matches = rhref.findall(response)
     for link in matches:
         # Remove everything after a "#" to deal with in-page anchors
         link = link[1].replace('\'', '').replace('"', '').split('#')[0]
@@ -219,24 +257,30 @@ def extractor(url):
             elif link[:2] == '//':
                 if link.split('/')[2].startswith(host):
                     verb('Internal page', link)
-                    internal.add(schema + link)
+                    internal.add(schema + '://' + link)
                 else:
                     verb('External page', link)
                     external.add(link)
             elif link[:1] == '/':
                 verb('Internal page', link)
-                internal.add(main_url + link)
+                internal.add(remove_file(url) + link)
             else:
                 verb('Internal page', link)
-                internal.add(main_url + '/' + link)
+                usable_url = remove_file(url)
+                if usable_url.endswith('/'):
+                    internal.add(usable_url + link)
+                elif link.startswith('/'):
+                    internal.add(usable_url + link)
+                else:
+                    internal.add(usable_url + '/' + link)
 
     if not only_urls:
-        intel_extractor(response)
+        intel_extractor(url, response)
         js_extractor(response)
     if args.regex and not supress_regex:
         regxy(args.regex, response, supress_regex, custom)
     if api:
-        matches = re.findall(r'[\w-]{16,45}', response)
+        matches = rentropy.findall(response)
         for match in matches:
             if entropy(match) >= 4:
                 verb('Key', match)
@@ -245,9 +289,9 @@ def extractor(url):
 
 def jscanner(url):
     """Extract endpoints from JavaScript code."""
-    response = requester(url, main_url, delay, cook, headers, timeout, host, ninja, user_agents, failed, processed)
+    response = requester(url, main_url, delay, cook, headers, timeout, host, proxies, user_agents, failed, processed)
     # Extract URLs/endpoints
-    matches = re.findall(r'[\'"](/.*?)[\'"]|[\'"](http.*?)[\'"]', response)
+    matches = rendpoint.findall(response)
     # Iterate over the matches, match is a tuple
     for match in matches:
         # Combining the items because one of them is always empty
@@ -262,7 +306,7 @@ def jscanner(url):
 then = time.time()
 
 # Step 1. Extract urls from robots.txt & sitemap.xml
-zap(main_url, args.archive, domain, host, internal, robots)
+zap(main_url, args.archive, domain, host, internal, robots, proxies)
 
 # This is so the level 1 emails are parsed as well
 internal = set(remove_regex(internal, args.exclude))
@@ -301,10 +345,21 @@ if not only_urls:
         if '=' in url:
             fuzzable.add(url)
 
-    for match in bad_intel:
-        for x in match:  # Because "match" is a tuple
-            if x != '':  # If the value isn't empty
-                intel.add(x)
+    for match, intel_name, url in bad_intel:
+        if isinstance(match, tuple):
+            for x in match:  # Because "match" is a tuple
+                if x != '':  # If the value isn't empty
+                    if intel_name == "CREDIT_CARD":
+                        if not luhn(match):
+                            # garbage number
+                            continue
+                    intel.add("%s:%s" % (intel_name, x))
+        else:
+            if intel_name == "CREDIT_CARD":
+                if not luhn(match):
+                    # garbage number
+                    continue
+            intel.add("%s:%s:%s" % (url, intel_name, match))
         for url in external:
             try:
                 if top_level(url, fix_protocol=True) in INTELS:
@@ -337,14 +392,14 @@ print(('%s-%s' % (red, end)) * 50)
 
 print('%s Total requests made: %i' % (info, len(processed)))
 print('%s Total time taken: %i minutes %i seconds' % (info, minutes, seconds))
-print('%s Requests per second: %i' % (info, int(len(processed)/diff)))
+print('%s Requests per second: %i' % (info, int(len(processed) / diff)))
 
 datasets = {
     'files': list(files), 'intel': list(intel), 'robots': list(robots),
     'custom': list(custom), 'failed': list(failed), 'internal': list(internal),
     'scripts': list(scripts), 'external': list(external),
     'fuzzable': list(fuzzable), 'endpoints': list(endpoints),
-    'keys' : list(keys)
+    'keys': list(keys)
 }
 
 if args.dns:
